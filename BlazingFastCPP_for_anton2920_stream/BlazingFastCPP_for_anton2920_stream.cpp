@@ -1,5 +1,6 @@
 #include <immintrin.h>
 #include <cmath>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <vector>
@@ -14,6 +15,8 @@
 #ifdef _MSC_VER
 #include <intrin.h>
 #endif
+
+#include "benchmark_options.h"
 
 #define WIDTH 800
 #define HEIGHT 600
@@ -110,29 +113,21 @@ namespace vecmath {
 		__m256 is_q2 = _mm256_castsi256_ps(_mm256_cmpeq_epi32(q, _mm256_set1_epi32(2)));
 		__m256 is_q3 = _mm256_castsi256_ps(_mm256_cmpeq_epi32(q, _mm256_set1_epi32(3)));
 		__m256 sin_val = _mm256_blendv_ps(s, c, is_q1);
-		__m256 neg_q2 = _mm256_blendv_ps(set1(1.0f), set1(-1.0f), is_q2);
-		__m256 neg_q3 = _mm256_blendv_ps(set1(1.0f), set1(-1.0f), is_q3);
-		__m256 neg = _mm256_mul_ps(neg_q2, neg_q3);
-		return _mm256_mul_ps(sin_val, neg);
+		__m256 sign = _mm256_and_ps(_mm256_or_ps(is_q2, is_q3), _mm256_castsi256_ps(_mm256_set1_epi32(0x80000000)));
+		return _mm256_xor_ps(sin_val, sign);
 	}
 
 	static inline __m256 v_cos(__m256 x) {
 		__m256 r; __m256i q; reduce_approx(x, r, q);
 		__m256 s = sin_poly(r);
 		__m256 c = cos_poly(r);
-		__m256 is_q0 = _mm256_castsi256_ps(_mm256_cmpeq_epi32(q, _mm256_set1_epi32(0)));
 		__m256 is_q1 = _mm256_castsi256_ps(_mm256_cmpeq_epi32(q, _mm256_set1_epi32(1)));
 		__m256 is_q2 = _mm256_castsi256_ps(_mm256_cmpeq_epi32(q, _mm256_set1_epi32(2)));
 		__m256 is_q3 = _mm256_castsi256_ps(_mm256_cmpeq_epi32(q, _mm256_set1_epi32(3)));
-		__m256 cos_q0 = c;
-		__m256 cos_q1 = _mm256_mul_ps(s, set1(-1.0f));
-		__m256 cos_q2 = _mm256_mul_ps(c, set1(-1.0f));
-		__m256 cos_q3 = s;
-		__m256 res = _mm256_blendv_ps(set1(0.0f), cos_q0, is_q0);
-		res = _mm256_blendv_ps(res, cos_q1, is_q1);
-		res = _mm256_blendv_ps(res, cos_q2, is_q2);
-		res = _mm256_blendv_ps(res, cos_q3, is_q3);
-		return res;
+		__m256 use_s = _mm256_or_ps(is_q1, is_q3);
+		__m256 base = _mm256_blendv_ps(c, s, use_s);
+		__m256 sign = _mm256_and_ps(_mm256_or_ps(is_q1, is_q2), _mm256_castsi256_ps(_mm256_set1_epi32(0x80000000)));
+		return _mm256_xor_ps(base, sign);
 	}
 
 	static const float INV_LN2 = 1.44269504088896341f;
@@ -186,6 +181,15 @@ namespace vecmath {
 		return _mm256_mul_ps(t, neg_one);
 	}
 
+	static inline __m256 v_tanh_positive(__m256 x) {
+		__m256 is_big = _mm256_cmp_ps(x, set1(9.0f), _CMP_GT_OQ);
+		__m256 e2x = v_exp(_mm256_add_ps(x, x));
+		__m256 num = _mm256_sub_ps(e2x, set1(1.0f));
+		__m256 den = _mm256_add_ps(e2x, set1(1.0f));
+		__m256 base = _mm256_div_ps(num, den);
+		return _mm256_blendv_ps(base, set1(1.0f), is_big);
+	}
+
 }
 
 inline __m256 vabs(__m256 x) {
@@ -211,16 +215,13 @@ inline void store_rgb8_u32_aligned(uint32* dst, int index, __m256 r, __m256 g, _
 	_mm256_store_si256((__m256i*)(dst + index), packed);
 }
 
-static inline void ShaderTiledAVX(uint32* pixels, int width, int height, float t) {
-	const int TILE_X = 64;
-	const int TILE_Y = 64;
+static inline void ShaderTiledAVX(uint32* pixels, float t) {
+	constexpr int width = WIDTH;
+	constexpr int height = HEIGHT;
+	static_assert((WIDTH % 8) == 0, "Fixed AVX2 renderer requires width divisible by 8.");
 
-	const float rw = (float)width;
-	const float rh = (float)height;
-
-	const int tilesX = (width + TILE_X - 1) / TILE_X;
-	const int tilesY = (height + TILE_Y - 1) / TILE_Y;
-	const int tilesN = tilesX * tilesY;
+	constexpr float rw = (float)WIDTH;
+	constexpr float rh = (float)HEIGHT;
 
 	const __m256 two = _mm256_set1_ps(2.0f);
 	const __m256 four = _mm256_set1_ps(4.0f);
@@ -244,24 +245,17 @@ static inline void ShaderTiledAVX(uint32* pixels, int width, int height, float t
 	}
 
 #pragma omp parallel for schedule(static)
-	for (int tileIndex = 0; tileIndex < tilesN; ++tileIndex) {
-		const int ty = (tileIndex / tilesX) * TILE_Y;
-		const int tx = (tileIndex % tilesX) * TILE_X;
-
-		const int ymax = std::min(ty + TILE_Y, height);
-		const int xmax = std::min(tx + TILE_X, width);
-
-		for (int y = ty; y < ymax; ++y) {
+	for (int y = 0; y < height; ++y) {
 			const float fy = (float)(height - y);
 			const __m256 fyV = _mm256_set1_ps(fy);
 
 			const __m256 py = _mm256_mul_ps(_mm256_sub_ps(_mm256_mul_ps(fyV, two), rhV), inv_rh);
 
-			int x = tx;
-			__m256 baseX = _mm256_set1_ps((float)tx);
+			int x = 0;
+			__m256 baseX = _mm256_setzero_ps();
 			__m256 fx = _mm256_add_ps(baseX, lane);
 
-			for (; x + 8 <= xmax; x += 8) {
+			for (; x < width; x += 8) {
 				__m256 px = _mm256_mul_ps(_mm256_sub_ps(_mm256_mul_ps(fx, two), rwV), inv_rh);
 
 				__m256 dotp = _mm256_fmadd_ps(px, px, _mm256_mul_ps(py, py));
@@ -274,7 +268,6 @@ static inline void ShaderTiledAVX(uint32* pixels, int width, int height, float t
 				__m256 oX = _mm256_setzero_ps();
 				__m256 oY = _mm256_setzero_ps();
 				__m256 oZ = _mm256_setzero_ps();
-				__m256 oW = _mm256_setzero_ps();
 
 				{
 					__m256 diff = vabs(_mm256_sub_ps(vx, vy));
@@ -283,7 +276,6 @@ static inline void ShaderTiledAVX(uint32* pixels, int width, int height, float t
 					oX = _mm256_fmadd_ps(sX, diff, oX);
 					oY = _mm256_fmadd_ps(sY, diff, oY);
 					oZ = _mm256_fmadd_ps(sY, diff, oZ);
-					oW = _mm256_fmadd_ps(sX, diff, oW);
 					__m256 argX = _mm256_add_ps(_mm256_mul_ps(vy, IK[0]), tV);
 					__m256 argY = _mm256_add_ps(_mm256_mul_ps(vx, IK[0]), _mm256_add_ps(IK[0], tV));
 					vx = _mm256_fmadd_ps(vecmath::v_cos(argX), INVIK[0], _mm256_add_ps(vx, c0p7));
@@ -295,7 +287,6 @@ static inline void ShaderTiledAVX(uint32* pixels, int width, int height, float t
 					oX = _mm256_fmadd_ps(sX, diff, oX);
 					oY = _mm256_fmadd_ps(sY, diff, oY);
 					oZ = _mm256_fmadd_ps(sY, diff, oZ);
-					oW = _mm256_fmadd_ps(sX, diff, oW);
 					argX = _mm256_add_ps(_mm256_mul_ps(vy, IK[1]), tV);
 					argY = _mm256_add_ps(_mm256_mul_ps(vx, IK[1]), _mm256_add_ps(IK[1], tV));
 					vx = _mm256_fmadd_ps(vecmath::v_cos(argX), INVIK[1], _mm256_add_ps(vx, c0p7));
@@ -307,7 +298,6 @@ static inline void ShaderTiledAVX(uint32* pixels, int width, int height, float t
 					oX = _mm256_fmadd_ps(sX, diff, oX);
 					oY = _mm256_fmadd_ps(sY, diff, oY);
 					oZ = _mm256_fmadd_ps(sY, diff, oZ);
-					oW = _mm256_fmadd_ps(sX, diff, oW);
 					argX = _mm256_add_ps(_mm256_mul_ps(vy, IK[2]), tV);
 					argY = _mm256_add_ps(_mm256_mul_ps(vx, IK[2]), _mm256_add_ps(IK[2], tV));
 					vx = _mm256_fmadd_ps(vecmath::v_cos(argX), INVIK[2], _mm256_add_ps(vx, c0p7));
@@ -319,7 +309,6 @@ static inline void ShaderTiledAVX(uint32* pixels, int width, int height, float t
 					oX = _mm256_fmadd_ps(sX, diff, oX);
 					oY = _mm256_fmadd_ps(sY, diff, oY);
 					oZ = _mm256_fmadd_ps(sY, diff, oZ);
-					oW = _mm256_fmadd_ps(sX, diff, oW);
 					argX = _mm256_add_ps(_mm256_mul_ps(vy, IK[3]), tV);
 					argY = _mm256_add_ps(_mm256_mul_ps(vx, IK[3]), _mm256_add_ps(IK[3], tV));
 					vx = _mm256_fmadd_ps(vecmath::v_cos(argX), INVIK[3], _mm256_add_ps(vx, c0p7));
@@ -331,7 +320,6 @@ static inline void ShaderTiledAVX(uint32* pixels, int width, int height, float t
 					oX = _mm256_fmadd_ps(sX, diff, oX);
 					oY = _mm256_fmadd_ps(sY, diff, oY);
 					oZ = _mm256_fmadd_ps(sY, diff, oZ);
-					oW = _mm256_fmadd_ps(sX, diff, oW);
 					argX = _mm256_add_ps(_mm256_mul_ps(vy, IK[4]), tV);
 					argY = _mm256_add_ps(_mm256_mul_ps(vx, IK[4]), _mm256_add_ps(IK[4], tV));
 					vx = _mm256_fmadd_ps(vecmath::v_cos(argX), INVIK[4], _mm256_add_ps(vx, c0p7));
@@ -343,7 +331,6 @@ static inline void ShaderTiledAVX(uint32* pixels, int width, int height, float t
 					oX = _mm256_fmadd_ps(sX, diff, oX);
 					oY = _mm256_fmadd_ps(sY, diff, oY);
 					oZ = _mm256_fmadd_ps(sY, diff, oZ);
-					oW = _mm256_fmadd_ps(sX, diff, oW);
 					argX = _mm256_add_ps(_mm256_mul_ps(vy, IK[5]), tV);
 					argY = _mm256_add_ps(_mm256_mul_ps(vx, IK[5]), _mm256_add_ps(IK[5], tV));
 					vx = _mm256_fmadd_ps(vecmath::v_cos(argX), INVIK[5], _mm256_add_ps(vx, c0p7));
@@ -355,7 +342,6 @@ static inline void ShaderTiledAVX(uint32* pixels, int width, int height, float t
 					oX = _mm256_fmadd_ps(sX, diff, oX);
 					oY = _mm256_fmadd_ps(sY, diff, oY);
 					oZ = _mm256_fmadd_ps(sY, diff, oZ);
-					oW = _mm256_fmadd_ps(sX, diff, oW);
 					argX = _mm256_add_ps(_mm256_mul_ps(vy, IK[6]), tV);
 					argY = _mm256_add_ps(_mm256_mul_ps(vx, IK[6]), _mm256_add_ps(IK[6], tV));
 					vx = _mm256_fmadd_ps(vecmath::v_cos(argX), INVIK[6], _mm256_add_ps(vx, c0p7));
@@ -367,21 +353,12 @@ static inline void ShaderTiledAVX(uint32* pixels, int width, int height, float t
 					oX = _mm256_fmadd_ps(sX, diff, oX);
 					oY = _mm256_fmadd_ps(sY, diff, oY);
 					oZ = _mm256_fmadd_ps(sY, diff, oZ);
-					oW = _mm256_fmadd_ps(sX, diff, oW);
-					argX = _mm256_add_ps(_mm256_mul_ps(vy, IK[7]), tV);
-					argY = _mm256_add_ps(_mm256_mul_ps(vx, IK[7]), _mm256_add_ps(IK[7], tV));
-					vx = _mm256_fmadd_ps(vecmath::v_cos(argX), INVIK[7], _mm256_add_ps(vx, c0p7));
-					vy = _mm256_fmadd_ps(vecmath::v_cos(argY), INVIK[7], _mm256_add_ps(vy, c0p7));
 				}
 
 				__m256 base = _mm256_sub_ps(l, four);
-				__m256 py_m1 = _mm256_mul_ps(py, _mm256_set1_ps(-1.0f));
-				__m256 py_p1 = _mm256_mul_ps(py, _mm256_set1_ps(+1.0f));
-				__m256 py_p2 = _mm256_mul_ps(py, _mm256_set1_ps(+2.0f));
-
-				__m256 baseR = _mm256_sub_ps(base, py_m1);
-				__m256 baseG = _mm256_sub_ps(base, py_p1);
-				__m256 baseB = _mm256_sub_ps(base, py_p2);
+				__m256 baseR = _mm256_add_ps(base, py);
+				__m256 baseG = _mm256_sub_ps(base, py);
+				__m256 baseB = _mm256_sub_ps(base, _mm256_add_ps(py, py));
 
 				__m256 eR = vecmath::v_exp(baseR);
 				__m256 eG = vecmath::v_exp(baseG);
@@ -391,57 +368,16 @@ static inline void ShaderTiledAVX(uint32* pixels, int width, int height, float t
 				__m256 dG = _mm256_max_ps(oY, eps);
 				__m256 dB = _mm256_max_ps(oZ, eps);
 
-				__m256 r = vecmath::v_tanh(_mm256_div_ps(_mm256_mul_ps(eR, five), dR));
-				__m256 g = vecmath::v_tanh(_mm256_div_ps(_mm256_mul_ps(eG, five), dG));
-				__m256 b = vecmath::v_tanh(_mm256_div_ps(_mm256_mul_ps(eB, five), dB));
+				__m256 r = vecmath::v_tanh_positive(_mm256_div_ps(_mm256_mul_ps(eR, five), dR));
+				__m256 g = vecmath::v_tanh_positive(_mm256_div_ps(_mm256_mul_ps(eG, five), dG));
+				__m256 b = vecmath::v_tanh_positive(_mm256_div_ps(_mm256_mul_ps(eB, five), dB));
 
 				store_rgb8_u32_aligned(pixels, y * width + x, r, g, b);
 
 				baseX = _mm256_add_ps(baseX, step8);
 				fx = _mm256_add_ps(baseX, lane);
 			}
-
-			for (; x < xmax; ++x) {
-				const float fxS = (float)x;
-				const float pxS = ((fxS * 2.0f) - rw) * (1.0f / rh);
-				const float pyS = ((fy * 2.0f) - rh) * (1.0f / rh);
-				const float dotpS = pxS * pxS + pyS * pyS;
-				const float lS = 4.0f - 4.0f * std::fabs(0.7f - dotpS);
-				float vxS = pxS * lS, vyS = pyS * lS;
-
-				float oX = 0.f, oY = 0.f, oZ = 0.f, oW = 0.f;
-				for (int k = 1; k <= 8; ++k) {
-					const float invk = 1.0f / (float)k;
-					const float diff = std::fabs(vxS - vyS);
-					const float sX = std::sinf(vxS) + 1.0f;
-					const float sY = std::sinf(vyS) + 1.0f;
-					oX += sX * diff;
-					oY += sY * diff;
-					oZ += sY * diff;
-					oW += sX * diff;
-					const float argX = vyS * (float)k + t;
-					const float argY = vxS * (float)k + (float)k + t;
-					vxS += std::cosf(argX) * invk + 0.7f;
-					vyS += std::cosf(argY) * invk + 0.7f;
-				}
-
-				const float base = lS - 4.0f;
-				auto final_map = [](float base, float den) {
-					const float e = std::expf(base);
-					const float d = (den <= 0.f ? 1e-12f : den);
-					return std::tanhf(5.0f * e / d);
-					};
-				const float r = final_map(base - pyS * (-1.0f), oX);
-				const float g = final_map(base - pyS * (+1.0f), oY);
-				const float b = final_map(base - pyS * (+2.0f), oZ);
-
-				const uint32 R = (uint32)std::lrintf(r * 255.0f);
-				const uint32 G = (uint32)std::lrintf(g * 255.0f);
-				const uint32 B = (uint32)std::lrintf(b * 255.0f);
-				pixels[y * width + x] = (R << 24) | (G << 16) | (B << 8);
-			}
 		}
-	}
 }
 
 int DumpPPM(const char* filename, const uint32* pixels, int width, int height) {
@@ -498,8 +434,6 @@ int DumpPPM(const char* filename, const uint32* pixels, int width, int height) {
 	return 0;
 }
 
-inline float CyclesToSeconds(uint64_t cycles, double cpuHz = 4.0e9) { return (float)(cycles / cpuHz); }
-
 struct FrameBuffers {
 	uint32* A = nullptr;
 	uint32* B = nullptr;
@@ -518,35 +452,41 @@ struct FrameBuffers {
 	void swap() { std::swap(A, B); }
 };
 
-int main() {
+int main(int argc, char** argv) {
+	BenchmarkOptions options;
+	const int parseResult = ParseBenchmarkOptions(argc, argv, &options);
+	if (parseResult != 0) {
+		PrintBenchmarkUsage(argv[0]);
+		return parseResult;
+	}
+	if (options.help) {
+		PrintBenchmarkUsage(argv[0]);
+		return 0;
+	}
+
 	FrameBuffers fb{ (size_t)WIDTH * HEIGHT };
 
-#if defined(_MSC_VER)
-	unsigned __int64 start = 0, end = 0, totalFrameTime = 0ULL;
-#else
-	unsigned long long start = 0, end = 0, totalFrameTime = 0ULL;
-#endif
-
 	float fi = 0.f;
-	const int count = 10;
-
-	ShaderTiledAVX(fb.front(), WIDTH, HEIGHT, fi);
-
-	for (int i = 0; i < count; ++i) {
-		start = __rdtsc();
-		ShaderTiledAVX(fb.back(), WIDTH, HEIGHT, fi);
-		end = __rdtsc();
-		totalFrameTime += (end - start);
+	for (int i = 0; i < options.warmup; ++i) {
+		ShaderTiledAVX(fb.back(), fi);
 		fb.swap();
 		fi += 1.f;
 	}
 
-	double avgCycles = (double)totalFrameTime / (double)count;
-	float frameTimeMs = CyclesToSeconds((uint64_t)avgCycles) * 1000.f;
-	std::printf("Took %f s to render %d frames (Avg: %f ms, FPS: %g)\n",
-		CyclesToSeconds(totalFrameTime), count, frameTimeMs, 1000.0 / frameTimeMs);
+	const auto start = std::chrono::steady_clock::now();
+	for (int i = 0; i < options.frames; ++i) {
+		ShaderTiledAVX(fb.back(), fi);
+		fb.swap();
+		fi += 1.f;
+	}
+	const auto end = std::chrono::steady_clock::now();
 
-	ShaderTiledAVX(fb.front(), WIDTH, HEIGHT, 0.0f);
-	DumpPPM("image.ppm", fb.front(), WIDTH, HEIGHT);
+	const double totalMs = std::chrono::duration<double, std::milli>(end - start).count();
+	PrintBenchmarkResult("blazingfastcpp", WIDTH, HEIGHT, options, totalMs);
+
+	if (options.writeOutput) {
+		ShaderTiledAVX(fb.front(), 0.0f);
+		DumpPPM(options.output, fb.front(), WIDTH, HEIGHT);
+	}
 	return 0;
 }

@@ -1,1 +1,15 @@
 .vs
+build/
+build-*/
+build-wsl/
+out/
+.wsl-tools/
+CMakeUserPresets.json
+*.suo
+*.user
+*.vcxproj
+*.vcxproj.filters
+*.sln
+*.slnx
+benchmark-*.csv
+*.ppm
