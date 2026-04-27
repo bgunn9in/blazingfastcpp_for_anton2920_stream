@@ -1,0 +1,120 @@
+#include <assert.h>
+#include <chrono>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <immintrin.h>
+
+#ifdef _MSC_VER
+#include <intrin.h>
+#include <malloc.h>
+#endif
+
+#include "benchmark_options.h"
+#include "shader.h"
+
+#define nil (void*)0ULL
+
+#define WIDTH 800
+#define HEIGHT 600
+
+using namespace ispc;
+
+
+static inline void*
+MallocAligned(size_t size, size_t alignment)
+{
+#ifdef _MSC_VER
+	return _aligned_malloc(size, alignment);
+#else
+	void* p = nil;
+	if (posix_memalign(&p, alignment, size) != 0) {
+		return nil;
+	}
+	return p;
+#endif
+}
+
+
+static inline void
+FreeAligned(void* p)
+{
+#ifdef _MSC_VER
+	_aligned_free(p);
+#else
+	free(p);
+#endif
+}
+
+
+int
+DumpPPM(const char *filename, unsigned int *pixels, int width, int height)
+{
+	unsigned int	pixel;
+	FILE * out;
+	int	i;
+
+	out = fopen(filename, "wb");
+	if (out == nil) {
+		perror("Failed to open file");
+		return 1;
+	}
+
+	fprintf(out, "P6 %d %d 255 ", width, height);
+	for (i = 0; i < width * height; i++) {
+		pixel = pixels[i];
+		fputc((pixel >> 24) & 0xFF, out);
+		fputc((pixel >> 16) & 0xFF, out);
+		fputc((pixel >> 8) & 0xFF, out);
+	}
+
+	return 0;
+}
+
+
+int
+main(int argc, char** argv)
+{
+	BenchmarkOptions options;
+	const int parseResult = ParseBenchmarkOptions(argc, argv, &options);
+	if (parseResult != 0) {
+		PrintBenchmarkUsage(argv[0]);
+		return parseResult;
+	}
+	if (options.help) {
+		PrintBenchmarkUsage(argv[0]);
+		return 0;
+	}
+
+	unsigned int	*pixels;
+	float	fi;
+	int	i;
+
+	pixels = (unsigned int *)MallocAligned(WIDTH * HEIGHT * sizeof(*pixels), 64);
+	assert(pixels != nil);
+	memset(pixels, 0, WIDTH * HEIGHT * sizeof(*pixels));
+
+	fi = 0;
+	for (i = 0; i < options.warmup; i++) {
+		Shader(pixels, WIDTH, HEIGHT, fi);
+		fi++;
+	}
+
+	const auto start = std::chrono::steady_clock::now();
+	for (i = 0; i < options.frames; i++) {
+		Shader(pixels, WIDTH, HEIGHT, fi);
+		fi++;
+	}
+	const auto end = std::chrono::steady_clock::now();
+
+	const double totalMs = std::chrono::duration<double, std::milli>(end - start).count();
+	PrintBenchmarkResult("ispc_parallel_fasta", WIDTH, HEIGHT, options, totalMs);
+
+	if (options.writeOutput) {
+		Shader(pixels, WIDTH, HEIGHT, 0.0f);
+		DumpPPM(options.output, pixels, WIDTH, HEIGHT);
+	}
+	FreeAligned(pixels);
+	return 0;
+}

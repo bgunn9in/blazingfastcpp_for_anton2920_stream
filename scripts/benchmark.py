@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 
-TARGETS = ("ispc_parallel", "blazingfastcpp")
+TARGETS = ("ispc_parallel", "ispc_parallel_fasta", "blazingfastcpp")
 
 
 def run_command(args: list[str], cwd: Path) -> None:
@@ -85,6 +85,33 @@ def run_one(
         "avg_ms": float(row["avg_ms"]),
         "fps": float(row["fps"]),
     }
+
+
+def write_visual_outputs(executables: dict[str, Path], output_dir: Path, env: dict[str, str] | None) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for name in TARGETS:
+        output_path = output_dir / f"{name}.ppm"
+        completed = subprocess.run(
+            [
+                str(executables[name]),
+                "--frames",
+                "1",
+                "--warmup",
+                "0",
+                "--output",
+                str(output_path),
+            ],
+            check=True,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if completed.stdout:
+            print(completed.stdout, end="")
+        if completed.stderr:
+            print(completed.stderr, file=sys.stderr, end="")
+        print(f"Wrote {output_path}")
 
 
 def stats(rows: list[dict[str, object]], name: str) -> dict[str, float | int | str]:
@@ -163,7 +190,7 @@ def main() -> int:
     script_dir = Path(__file__).resolve().parent
     source_dir = script_dir.parent
 
-    parser = argparse.ArgumentParser(description="Build and compare ispc_parallel vs blazingfastcpp.")
+    parser = argparse.ArgumentParser(description="Build and compare ISPC and C++ renderers.")
     parser.add_argument("--frames", type=int, default=300, help="Measured frames per run.")
     parser.add_argument("--warmup", type=int, default=20, help="Warmup frames before timing.")
     parser.add_argument("--runs", type=int, default=7, help="Benchmark runs per executable.")
@@ -172,6 +199,9 @@ def main() -> int:
     parser.add_argument("--out-csv", type=Path, default=None, help="Write per-run raw results to CSV.")
     parser.add_argument("--skip-build", action="store_true", help="Do not configure/build before running.")
     parser.add_argument("--omp-num-threads", type=int, default=None, help="Set OMP_NUM_THREADS for benchmarked processes.")
+    parser.add_argument("--write-images", action="store_true", help="Render one PPM image per executable.")
+    parser.add_argument("--images-only", action="store_true", help="Render images and skip benchmark timing.")
+    parser.add_argument("--images-dir", type=Path, default=source_dir, help="Directory for --write-images outputs.")
     args = parser.parse_args()
 
     if args.frames <= 0:
@@ -195,6 +225,11 @@ def main() -> int:
     child_env = os.environ.copy()
     if args.omp_num_threads is not None:
         child_env["OMP_NUM_THREADS"] = str(args.omp_num_threads)
+
+    if args.write_images or args.images_only:
+        write_visual_outputs(executables, args.images_dir.resolve(), child_env)
+        if args.images_only:
+            return 0
 
     rows: list[dict[str, object]] = []
     for run_index in range(1, args.runs + 1):
